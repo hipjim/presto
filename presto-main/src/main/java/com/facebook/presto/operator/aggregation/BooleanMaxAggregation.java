@@ -16,140 +16,112 @@ package com.facebook.presto.operator.aggregation;
 import com.facebook.presto.block.Block;
 import com.facebook.presto.block.BlockBuilder;
 import com.facebook.presto.block.BlockCursor;
-import com.facebook.presto.operator.GroupByIdBlock;
-import com.facebook.presto.util.array.ByteBigArray;
-import com.google.common.base.Optional;
+import com.facebook.presto.tuple.TupleInfo;
+import io.airlift.slice.Slice;
 
 import static com.facebook.presto.tuple.TupleInfo.SINGLE_BOOLEAN;
-import static com.facebook.presto.tuple.TupleInfo.Type.BOOLEAN;
-import static com.google.common.base.Preconditions.checkState;
 
 public class BooleanMaxAggregation
-        extends SimpleAggregationFunction
+        implements FixedWidthAggregationFunction
 {
     public static final BooleanMaxAggregation BOOLEAN_MAX = new BooleanMaxAggregation();
 
-    public BooleanMaxAggregation()
+    @Override
+    public int getFixedSize()
     {
-        super(SINGLE_BOOLEAN, SINGLE_BOOLEAN, BOOLEAN);
+        return SINGLE_BOOLEAN.getFixedSize();
     }
 
     @Override
-    protected GroupedAccumulator createGroupedAccumulator(Optional<Integer> maskChannel, int valueChannel)
+    public TupleInfo getFinalTupleInfo()
     {
-        // Min/max are not effected by distinct, so ignore it.
-        return new BooleanMinGroupedAccumulator(valueChannel);
+        return SINGLE_BOOLEAN;
     }
 
-    public static class BooleanMinGroupedAccumulator
-            extends SimpleGroupedAccumulator
+    @Override
+    public TupleInfo getIntermediateTupleInfo()
     {
-        private static final byte NULL_VALUE = 0;
-        private static final byte TRUE_VALUE = 1;
-        private static final byte FALSE_VALUE = -1;
+        return SINGLE_BOOLEAN;
+    }
 
-        private final ByteBigArray maxValues;
+    @Override
+    public void initialize(Slice valueSlice, int valueOffset)
+    {
+        // mark value null
+        SINGLE_BOOLEAN.setNull(valueSlice, valueOffset, 0);
+        SINGLE_BOOLEAN.setBoolean(valueSlice, valueOffset, 0, Boolean.FALSE);
+    }
 
-        public BooleanMinGroupedAccumulator(int valueChannel)
-        {
-            // Min/max are not effected by distinct, so ignore it.
-            super(valueChannel, SINGLE_BOOLEAN, SINGLE_BOOLEAN, Optional.<Integer>absent());
-            this.maxValues = new ByteBigArray();
+    @Override
+    public void addInput(BlockCursor cursor, int field, Slice valueSlice, int valueOffset)
+    {
+        if (cursor.isNull(field)) {
+            return;
         }
 
-        @Override
-        public long getEstimatedSize()
-        {
-            return maxValues.sizeOf();
-        }
+        // mark value not null
+        SINGLE_BOOLEAN.setNotNull(valueSlice, valueOffset, 0);
 
-        @Override
-        protected void processInput(GroupByIdBlock groupIdsBlock, Block valuesBlock, Optional<Block> maskBlock)
-        {
-            maxValues.ensureCapacity(groupIdsBlock.getGroupCount());
-
-            BlockCursor values = valuesBlock.cursor();
-
-            for (int position = 0; position < groupIdsBlock.getPositionCount(); position++) {
-                checkState(values.advanceNextPosition());
-
-                // skip null values
-                if (!values.isNull()) {
-                    long groupId = groupIdsBlock.getGroupId(position);
-
-                    // if value is true, update the max to true
-                    if (values.getBoolean()) {
-                        maxValues.set(groupId, TRUE_VALUE);
-                    }
-                    else {
-                        // if the current value is null, set the max to false
-                        if (maxValues.get(groupId) == NULL_VALUE) {
-                            maxValues.set(groupId, FALSE_VALUE);
-                        }
-                    }
-                }
-            }
-        }
-
-        @Override
-        public void evaluateFinal(int groupId, BlockBuilder output)
-        {
-            byte value = maxValues.get((long) groupId);
-            if (value == NULL_VALUE) {
-                output.appendNull();
-            }
-            else {
-                output.append(value == TRUE_VALUE);
-            }
+        // update current value
+        boolean newValue = cursor.getBoolean(field);
+        if (newValue) {
+            SINGLE_BOOLEAN.setBoolean(valueSlice, valueOffset, 0, true);
         }
     }
 
     @Override
-    protected Accumulator createAccumulator(Optional<Integer> maskChannel, int valueChannel)
+    public void addInput(int positionCount, Block block, int field, Slice valueSlice, int valueOffset)
     {
-        // Min/max are not effected by distinct, so ignore it.
-        return new BooleanMaxAccumulator(valueChannel);
-    }
+        // initialize
+        boolean hasNonNull = !SINGLE_BOOLEAN.isNull(valueSlice, valueOffset);
 
-    public static class BooleanMaxAccumulator
-            extends SimpleAccumulator
-    {
-        private boolean notNull;
-        private boolean max;
-
-        public BooleanMaxAccumulator(int valueChannel)
-        {
-            // Min/max are not effected by distinct, so ignore it.
-            super(valueChannel, SINGLE_BOOLEAN, SINGLE_BOOLEAN, Optional.<Integer>absent());
+        // if we already have TRUE for the max value, don't process the block
+        if (hasNonNull && SINGLE_BOOLEAN.getBoolean(valueSlice, valueOffset, field) == true) {
+            return;
         }
 
-        @Override
-        protected void processInput(Block block, Optional<Block> maskBlock)
-        {
-            BlockCursor values = block.cursor();
+        boolean max = false;
 
-            for (int position = 0; position < block.getPositionCount(); position++) {
-                checkState(values.advanceNextPosition());
-                if (!values.isNull()) {
-                    notNull = true;
-
-                    // if value is true, update the max to true
-                    if (values.getBoolean()) {
-                        max = true;
-                    }
+        // process block
+        BlockCursor cursor = block.cursor();
+        while (cursor.advanceNextPosition()) {
+            if (!cursor.isNull(field)) {
+                hasNonNull = true;
+                if (cursor.getBoolean(field)) {
+                    max = true;
+                    break;
                 }
             }
         }
 
-        @Override
-        public void evaluateFinal(BlockBuilder out)
-        {
-            if (notNull) {
-                out.append(max);
-            }
-            else {
-                out.appendNull();
-            }
+        // write new value
+        if (hasNonNull) {
+            SINGLE_BOOLEAN.setNotNull(valueSlice, valueOffset, 0);
+            SINGLE_BOOLEAN.setBoolean(valueSlice, valueOffset, 0, max);
+        }
+    }
+
+    @Override
+    public void addIntermediate(BlockCursor cursor, int field, Slice valueSlice, int valueOffset)
+    {
+        addInput(cursor, field, valueSlice, valueOffset);
+    }
+
+    @Override
+    public void evaluateIntermediate(Slice valueSlice, int valueOffset, BlockBuilder output)
+    {
+        evaluateFinal(valueSlice, valueOffset, output);
+    }
+
+    @Override
+    public void evaluateFinal(Slice valueSlice, int valueOffset, BlockBuilder output)
+    {
+        if (!SINGLE_BOOLEAN.isNull(valueSlice, valueOffset, 0)) {
+            boolean currentValue = SINGLE_BOOLEAN.getBoolean(valueSlice, valueOffset, 0);
+            output.append(currentValue);
+        }
+        else {
+            output.appendNull();
         }
     }
 }
